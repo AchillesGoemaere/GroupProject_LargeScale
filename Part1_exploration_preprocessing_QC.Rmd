@@ -1,4 +1,3 @@
-
 ---
 title: "LSABD group project – Part 1: exploration, preprocessing and quality control of NHANES 2021–2023"
 author: "Group ..."
@@ -7,7 +6,7 @@ output:
   html_document:
     toc: true
     toc_float: true
-    number_sections: true
+    number_sections: false
     code_folding: show
 ---
 
@@ -18,18 +17,46 @@ knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
 
 # Aim of this notebook
 
-This notebook prepares the NHANES 2021–2023 dataset for the analyses in parts 2–4. The theme of our project is **obesity in US adults**: who is at risk (part 2), which laboratory profile accompanies it (part 3), and whether it can be predicted from that profile (part 4). Following the guiding questions of the assignment, we:
+This notebook carries out **part 1** of the project plan (steps 1.1–1.12): it prepares the NHANES 2021–2023 dataset for the analyses in parts 2–4. The theme of our project is **obesity in US adults**: who is at risk (part 2), which laboratory profile accompanies it (part 3), and whether it can be predicted from that profile (part 4). Following the guiding questions of the assignment, we:
 
-1. describe the structure of the data (samples, features, variable types);
-2. define the study population;
-3. find and handle quality problems (special codes, top-coding, missing values, outliers);
-4. select and transform the laboratory features with justified, label-independent criteria;
-5. check with a PCA whether samples cluster by biology or by technical factors;
-6. save the preprocessed data for the next parts.
+| Step | What | Why |
+|---|---|---|
+| 1.1 | Load the data and check the file | First make sure the data are read correctly (lesson 2) |
+| 1.2 | Structure and variable types | Guiding question 1; the type decides which model fits |
+| 1.3 | Study population | BMI cut-offs apply to adults only; pregnancy changes weight and blood values |
+| 1.4 | Special codes and top-coding | Otherwise codes such as 999 are treated as real values |
+| 1.5 | Derived and recoded variables | Outcome and covariates for parts 2–4 |
+| 1.6 | Descriptive statistics | Get to know each variable first (lesson 2) |
+| 1.7 | Missing values | Guiding question 2; is a complete-case analysis reliable? |
+| 1.8 | Selection of laboratory features | Remove uninformative features without using group labels (part 3) |
+| 1.9 | Normalisation and log2 transformation | Symmetric distributions for linear models |
+| 1.10 | Outliers | Guiding question 3: technical error or biology? |
+| 1.11 | Standardisation, PCA and clustering | Guiding question 5: biology or technical factor? |
+| 1.12 | Save the preprocessed data | Parts 2–4 start from the same data |
 
-Every preprocessing decision is motivated in the text directly above or below the code that implements it.
+Every preprocessing decision is motivated in the text directly above or below the code that implements it. The chunks can be run one by one in RStudio (green arrow) or all at once with **Knit**.
 
-# Packages and data
+## Research framework
+
+Following the structure of lesson 1 (goal, aim, question, hypothesis, objectives):
+
+| Concept | Our project |
+|---|---|
+| **Goal** | Contribute to a better understanding of obesity-related health risks in US adults. |
+| **Aim** | Describe which adults are obese and which blood profile accompanies obesity, using NHANES 2021–2023. |
+| **Research questions** | RQ1 (part 2): does the association between race/ethnicity and obesity differ between men and women, after adjustment for age and income? RQ2 (part 3): which of 20 a priori selected blood markers differ between obese and non-obese adults, after adjustment for age, sex, race/ethnicity and smoking? RQ3 (part 4): how well can obesity be predicted from the blood profile, age and sex, and which markers are most important? |
+| **Hypotheses** | H1: ethnic differences in obesity are larger in women than in men (as reported by Flegal et al., 2010). H2: obesity is associated with an unfavourable glucose, lipid, liver and inflammation profile, independent of age, sex, race/ethnicity and smoking. H3: a model with blood markers predicts obesity better than a model with only age and sex. |
+| **Objectives** | (1) Explore and preprocess the data (this notebook); (2) fit a logistic regression with an interaction term; (3) fit 20 adjusted linear models with Benjamini-Hochberg correction; (4) train and evaluate machine learning models on a held-out test set. |
+
+The study is **cross-sectional** (all variables measured at one visit): we can study associations, not cause and effect.
+
+## Order of the preprocessing steps
+
+We follow the order recommended in lesson 2: **inspect the data → handle missing values (filter or impute) → normalise → log-transform → standardise**, followed by quality control with visualisations (heatmap with clustering, PCA). Batch correction (optional step 4 of lesson 2) is only needed if the quality control reveals a technical effect.
+
+# Step 0: setup
+
+*What: load the packages and set the paths. Why: all later steps use them; change only `data_dir` on your own computer.*
 
 ```{r packages}
 library(tidyverse)       # data wrangling and ggplot2
@@ -42,8 +69,16 @@ theme_set(theme_classic())
 Change `data_dir` to the folder that contains the two csv files on your own computer. All other paths are built from it.
 
 ```{r paths}
-data_dir <- "C:/Users/achil/OneDrive/Documenten/AJ 2026-2027/Semester 1/Large Scale Analysis of Biomedical Data/Group Project"
+data_dir <- "C:/Users/achil/Documents/GitHub/GroupProject_LargeScale/data" 
+
+# Folder for the preprocessed data and tables (created if it does not exist)
+output_dir <- file.path(data_dir, "output")
+dir.create(output_dir, showWarnings = FALSE)
 ```
+
+# Step 1.1: load the data and check the file
+
+*What: read the data and the codebook, check identifiers and parsing problems. Why: lesson 2 — first make sure the data are read correctly before analysing.*
 
 Two files were provided:
 
@@ -66,9 +101,16 @@ all(colnames(nhanes_raw) == codebook$variable)
 
 # Is every participant present only once?
 anyDuplicated(nhanes_raw$SEQN) == 0
+
+# Parsing problems, e.g. text in a numeric column or a wrong decimal separator
+nrow(problems(nhanes_raw))
 ```
 
-# Structure of the data
+Before any analysis, lesson 2 recommends checking how the file is built. The data are comma-separated with a dot as decimal separator, every participant has a unique identifier (`SEQN`), and `read_csv()` reports no parsing problems, so no column contains text where a number is expected. Missing values are stored as empty fields, which `read_csv()` converts to `NA`. However, NHANES also uses numeric codes for "refused" and "don't know" (e.g. 7/9, 77/99), which R does not recognise as missing; we recode them in step 1.4.
+
+# Step 1.2: structure and variable types
+
+*What: count samples and features, classify every variable. Why: guiding question 1; the variable type decides which model fits later.*
 
 ## Samples and features
 
@@ -142,7 +184,9 @@ tribble(
 ) %>% knitr::kable()
 ```
 
-# Study population
+# Step 1.3: study population
+
+*What: keep interviewed and examined adults (≥ 20 years) who are not pregnant. Why: BMI cut-offs only apply to adults; pregnancy changes weight and blood values; without examination there are no measurements.*
 
 We restrict the analyses to:
 
@@ -172,7 +216,9 @@ nhanes <- nhanes_raw %>%
 
 The study population contains **6,023 adults**.
 
-# Special codes and top-coding
+# Step 1.4: special codes and top-coding
+
+*What: recode "refused"/"don't know" codes to `NA` and count top-coded values. Why: otherwise R treats e.g. "999 drinks" as a real value.*
 
 ## Special codes
 
@@ -216,18 +262,27 @@ Two variables are top-coded for privacy reasons. These are not errors, but they 
 - `RIDAGEYR` = 80 means "80 years or older" (`r sum(nhanes$RIDAGEYR == 80)` participants);
 - `INDFMPIR` = 5 means "income at least 5 times the poverty level" (`r sum(nhanes$INDFMPIR == 5, na.rm = TRUE)` participants).
 
-We keep these values. In regression models, the effect of age above 80 and of high incomes will therefore be underestimated slightly.
+We keep these participants, with their top-coded value:
 
-# Derived and recoded variables
+- They are real, valid measurements: someone with value 80 is truly at least 80 years old. Only the exact value is hidden, which is a choice of NHANES to protect privacy, not a measurement error.
+- Removing them would throw away 342 adults (5.7%) aged 80 or older and 1,322 adults (25.2% of those with an income value) with the highest incomes.
+- The sample would then no longer contain the oldest and the richest participants, which would bias every comparison.
+- Setting them to NA would create missing values that depend on the value itself (MNAR), the most problematic type of missingness. Imputing a "true" value would only be a guess.
+
+The consequence is that differences within the top group (e.g. between 82 and 90 years) cannot be seen, so a linear effect of age or income in a regression model may be slightly distorted at the top of the range. For income this concerns a quarter of the participants, so in part 2 we will also use income categories (ratio < 1.3, 1.3–3.5 and ≥ 3.5). In categories, the top-coding no longer matters.
+
+# Step 1.5: derived and recoded variables
+
+*What: readable factors, mean blood pressure, BMI categories, obesity, abdominal obesity and smoking status. Why: needed as outcome and covariates in parts 2–4.*
 
 We convert the coded categorical variables to factors with readable labels, and derive the variables needed in parts 2–4:
 
 - **Race/ethnicity**: non-Hispanic White, the largest group, is the reference level, as in Flegal et al.
 - **Education** is an ordered factor.
-- **Blood pressure**: the mean of the (up to) three oscillometric readings, as in Micha et al. and notebook 3. `rowMeans()` returns `NaN` when all three readings are missing; we turn that into `NA`.
+- **Blood pressure**: the mean of the (up to) three oscillometric readings, as in Micha et al. `rowMeans()` returns `NaN` when all three readings are missing; we turn that into `NA`.
 - **BMI categories** use the WHO cut-offs: overweight 25–29.9, obesity ≥ 30. Obesity (BMI ≥ 30) is the outcome of part 2 and the contrast of part 3.
 - **Abdominal obesity**: waist circumference > 102 cm in men or > 88 cm in women. BMI does not show where fat is stored, so this alternative definition will be used as a sensitivity analysis.
-- **Smoking status** is derived from serum cotinine, a breakdown product of nicotine: cotinine ≥ 3 ng/mL = current smoker. This objective measure does not depend on self-report. Cotinine was not kept as a laboratory feature (section 8: a large share of the values is below the detection limit, which is exactly what makes it a good marker of non-smoking). Smoking is a confounder in part 3, because it affects inflammation markers and white blood cells.
+- **Smoking status** is derived from serum cotinine, a breakdown product of nicotine: cotinine ≥ 3 ng/mL = current smoker. This objective measure does not depend on self-report. Cotinine was not kept as a laboratory feature (step 1.8: a large share of the values is below the detection limit, which is exactly what makes it a good marker of non-smoking). Smoking is a confounder in part 3, because it affects inflammation markers and white blood cells.
 
 ```{r derive}
 nhanes <- nhanes %>%
@@ -271,7 +326,106 @@ nhanes %>% count(smoker)
 table(BMI = nhanes$obese, waist = nhanes$abdominal_obese)
 ```
 
-# Missing values
+# Step 1.6: descriptive statistics
+
+*What: summary statistics, histograms, bar charts and bivariate relations. Why: lesson 2 — get to know each variable on its own before analysing.*
+
+## Continuous variables
+
+As in the exploration workflow of lesson 2, we first describe each variable on its own: central tendency (mean, median), spread (SD, quartiles, range) and distribution (histograms).
+
+```{r descriptives}
+continuous_vars <- c(`Age (years)` = "RIDAGEYR", `BMI (kg/m²)` = "BMXBMI",
+                     `Waist circumference (cm)` = "BMXWAIST",
+                     `Systolic BP (mmHg)` = "sbp", `Diastolic BP (mmHg)` = "dbp",
+                     `Income-to-poverty ratio` = "INDFMPIR")
+
+desc_tbl <- map_dfr(names(continuous_vars), function(lab) {
+  x <- nhanes[[continuous_vars[[lab]]]]
+  tibble(variable = lab,
+         n = sum(!is.na(x)), n_missing = sum(is.na(x)),
+         mean = mean(x, na.rm = TRUE), sd = sd(x, na.rm = TRUE),
+         median = median(x, na.rm = TRUE),
+         Q1 = quantile(x, 0.25, na.rm = TRUE), Q3 = quantile(x, 0.75, na.rm = TRUE),
+         min = min(x, na.rm = TRUE), max = max(x, na.rm = TRUE))
+})
+knitr::kable(desc_tbl, digits = 1)
+```
+
+```{r histograms, fig.height = 6}
+nhanes %>%
+  select(all_of(continuous_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  drop_na(value) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 40, fill = "grey60") +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  labs(x = NULL, y = "Number of participants")
+```
+
+The mean BMI is 29.8 kg/m² (median 28.5): the average participant is overweight. BMI and waist circumference are slightly right-skewed (a tail of severe obesity). The income-to-poverty ratio shows a peak at 5 because of top-coding (step 1.4), and age a peak at 80 for the same reason.
+
+## Categorical variables
+
+```{r barcharts, fig.height = 7}
+categorical_vars <- c(Sex = "sex", `Race/ethnicity` = "race_eth", Education = "education",
+                      `Age group` = "age_group", `BMI category` = "bmi_cat",
+                      `Smoking (cotinine)` = "smoker")
+
+nhanes %>%
+  select(all_of(categorical_vars)) %>%
+  mutate(across(everything(), as.character)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "category") %>%
+  ggplot(aes(y = category)) +
+  geom_bar(fill = "grey60") +
+  facet_wrap(~ variable, scales = "free", ncol = 2) +
+  labs(x = "Number of participants", y = NULL)
+```
+
+All groups are large enough for the analyses in parts 2–4. The smallest race/ethnicity group (non-Hispanic Asian) still contains more than 300 adults with a BMI. `NA` in the bar charts are missing values (e.g. no cotinine measurement).
+
+## Relations between variables
+
+Bivariate exploration (lesson 2: correlation analysis and scatter plots) shows which variables carry overlapping information. Strongly correlated explanatory variables should not be combined in one regression model (collinearity, lesson 3).
+
+```{r bivariate}
+round(cor(nhanes[, continuous_vars], use = "pairwise.complete.obs", method = "spearman"), 2)
+```
+
+```{r scatter, fig.height = 4}
+ggarrange(
+  ggplot(nhanes, aes(x = BMXBMI, y = BMXWAIST, colour = sex)) +
+    geom_point(size = 0.4, alpha = 0.3) +
+    labs(x = "BMI (kg/m²)", y = "Waist circumference (cm)", colour = NULL),
+  ggplot(nhanes, aes(x = RIDAGEYR, y = sbp)) +
+    geom_point(size = 0.4, alpha = 0.3) +
+    geom_smooth(method = "loess", colour = "#B2182B") +
+    labs(x = "Age (years)", y = "Systolic BP (mmHg)"),
+  ncol = 2, common.legend = TRUE
+)
+```
+
+BMI and waist circumference are very strongly correlated, so we use them as alternative definitions of obesity and never together in one model. Systolic blood pressure rises with age, which illustrates why age is a confounder in many of our analyses.
+
+# Step 1.7: missing values
+
+*What: where values are missing, why (MCAR/MAR/MNAR), and whether the complete cases are representative. Why: guiding question 2.*
+
+## Overview: how missing values are handled per analysis
+
+We do not impute (the reasons are given at the end of this step). A participant with a missing value in a variable of an analysis therefore drops out of **that** analysis. Dropping participants is only a problem if the ones who drop out differ systematically from the others: then the remaining sample is no longer representative and the result can be biased.
+
+So the rule we follow is: **for each analysis, look at the variables in its model, see how many participants drop out because of missing values in them, and check the dropouts where there are many.** A variable with only a few missing values (e.g. 4 for education) cannot bias the result; a variable with hundreds of missing values can.
+
+| Analysis | Variables in the model | % missing | Participants left | Where checked |
+|---|---|---|---|---|
+| All parts | laboratory panels measured in a subsample (PFAS, VOCs, fasting panels) | 50–80% | not used | removed by the feature filter (step 1.8) |
+| Part 2 | obesity (BMI), race/ethnicity, sex, age, education | 0–1.6% | — | too few missing to matter |
+| Part 2 | **income** | **13.1%** | 5,156 of 5,929 | **income check below** |
+| Part 3 | 20 blood markers + cotinine (smoking) | together 12% | 5,190 of 5,929 | complete-case check below |
+| Part 4 | 101 blood markers | up to 11% per marker | to be decided in part 4 | imputation fitted on the training set, or complete cases |
+
+The two checks below therefore cover the two analyses where many participants drop out: income in part 2 and the blood markers in part 3.
 
 ## Where are the missing values?
 
@@ -304,7 +458,7 @@ Most of the missing values are **missing by design** (planned missingness), not 
 - **Skip patterns** in questionnaires: for example, `ALQ130` (drinks per day) is only asked to people who drank alcohol in the past year.
 - **Non-participation in a component**: 293 adults (4.9%) have no blood measurements (e.g. no blood draw). They are similar to the other participants in mean age (51.2 vs 54.2 years) and sex (54.3% vs 54.9% women).
 
-Because subsample selection is random, the missingness in the subsample panels can be considered missing completely at random (MCAR) with respect to the participants' characteristics. Imputing a panel that is missing for 50–80% of the participants would mostly create artificial data. We therefore **do not impute**, but select variables with a low proportion of missing values (section 8) and use complete cases per analysis. The age and sex comparison for the missing blood draw:
+Because subsample selection is random, the missingness in the subsample panels can be considered missing completely at random (MCAR) with respect to the participants' characteristics. Imputing a panel that is missing for 50–80% of the participants would mostly create artificial data. We therefore **do not impute**, but select variables with a low proportion of missing values (step 1.8) and use complete cases per analysis. The age and sex comparison for the missing blood draw:
 
 ```{r missing-blood}
 nhanes %>%
@@ -315,7 +469,97 @@ nhanes %>%
             pct_female = mean(sex == "Female") * 100)
 ```
 
-# Selection of laboratory features
+## Missing values in the variables we will use
+
+The figure below shows the missingness pattern of the main analysis variables for 300 randomly chosen participants, sorted by their number of missing values. Each column is a participant, each row a variable. Most participants are complete; the missing blood values occur together (the same participants miss all of them), and income is the variable with most missing values.
+
+```{r missing-pattern, fig.height = 4}
+analysis_vars <- c(BMI = "BMXBMI", Waist = "BMXWAIST", `Systolic BP` = "sbp",
+                   Income = "INDFMPIR", Education = "DMDEDUC2", Cotinine = "LBXCOT",
+                   HbA1c = "LBXGH", CRP = "LBXHSCRP", `Total cholesterol` = "LBXTC",
+                   ALT = "LBXSATSI", `Vitamin D` = "LBXVIDMS", `Urine albumin/creatinine` = "URDACT")
+
+tibble(variable = names(analysis_vars),
+       pct_missing = round(colMeans(is.na(nhanes[, analysis_vars])) * 100, 1)) %>%
+  knitr::kable()
+
+set.seed(2026)
+nhanes %>%
+  select(SEQN, all_of(analysis_vars)) %>%
+  slice_sample(n = 300) %>%
+  mutate(across(-SEQN, is.na)) %>%
+  mutate(n_missing = rowSums(pick(-SEQN))) %>%
+  arrange(n_missing) %>%
+  mutate(participant = row_number()) %>%
+  select(-SEQN, -n_missing) %>%
+  pivot_longer(-participant, names_to = "variable", values_to = "missing") %>%
+  ggplot(aes(x = participant, y = variable, fill = missing)) +
+  geom_tile() +
+  scale_fill_manual(values = c(`FALSE` = "grey85", `TRUE` = "#B2182B"),
+                    labels = c("observed", "missing")) +
+  labs(x = "300 random participants (sorted by number of missing values)", y = NULL, fill = NULL)
+```
+
+Income has the most missing values (13.1%). We check whether this missingness depends on other variables:
+
+```{r missing-income}
+nhanes %>%
+  group_by(education) %>%
+  summarise(n = n(), pct_income_missing = round(mean(is.na(INDFMPIR)) * 100, 1))
+
+nhanes %>%
+  filter(!is.na(obese)) %>%
+  group_by(obese) %>%
+  summarise(n = n(), pct_income_missing = round(mean(is.na(INDFMPIR)) * 100, 1))
+```
+
+Income is missing more often in participants with a low education level (23% below 9th grade versus 11% for college graduates), but hardly differs between obese and non-obese adults.
+
+## Type of missingness: MCAR, MAR or MNAR?
+
+Lesson 2 distinguishes three types of missing data. We classify each source:
+
+| Source of missing values | Type | Reasoning |
+|---|---|---|
+| Random subsample panels (PFAS, VOCs) | **MCAR** | Participants were selected at random for these measurements. |
+| Fasting panels (fasting glucose, insulin, LDL, triglycerides) | **MAR** | Only measured in the morning session, a recorded variable (`PHDSESNZ`). |
+| Age- or sex-specific panels (e.g. ferritin) and childhood questionnaires | **MAR** | Completely predictable from age and sex. |
+| Skip patterns (e.g. drinks per day for non-drinkers) | not truly missing | The question does not apply. |
+| No blood measurements (4.9% of adults) | **close to MCAR** | Hardly any difference in age or sex with the other participants. |
+| Income (13.1%) | **MAR** (possibly MNAR) | Predictable from education. It could also be MNAR, if people with a very low or high income refuse to report it, but that cannot be tested with the data. |
+| Values below the detection limit | **MNAR** | The value is missing *because* it is low. NHANES already filled these with the detection limit divided by √2, which is a constant imputation; features where this applies to more than half of the values were removed (step 1.8). |
+
+## Imputation or not?
+
+Lesson 2 describes several imputation methods: mean or median imputation, most-frequent-value imputation for categorical variables, constant imputation and kNN imputation. We decided **not to impute** in parts 1–3:
+
+- The panels with much missing data (50–80%) are removed by the feature filter. Imputing them would mostly create artificial data.
+- The variables we keep have at most 11% (laboratory) or 13% (income) missing values.
+- A complete-case analysis guarantees that all 20 tests in part 3 are based on **the same participants**, so the results are comparable (lesson 2 warns that models fitted on different observations cannot be compared).
+
+Complete-case analysis is only unbiased if the excluded participants do not differ systematically from the others. We check this for the participants used in part 3 (all 20 markers and cotinine available) versus the excluded ones:
+
+```{r complete-case-check}
+markers_part3 <- c("LBXGH", "LBXSGL", "LBDHDD", "LBXSTR", "LBXTC", "LBXSUA", "LBXMAGN",
+                   "LBXSATSI", "LBXSASSI", "LBXSGTSI", "LBXSAL", "LBXHSCRP", "LBXWBCSI",
+                   "LBDNENO", "LBXSCR", "URDACT", "LBXSBU", "LBXSHBG", "LBXVIDMS", "LBXSIR")
+
+nhanes %>%
+  filter(!is.na(BMXBMI)) %>%
+  mutate(complete = if_else(if_all(all_of(c(markers_part3, "LBXCOT")), ~ !is.na(.x)),
+                            "Complete case", "Excluded")) %>%
+  group_by(complete) %>%
+  summarise(n = n(), mean_age = mean(RIDAGEYR), pct_female = mean(sex == "Female") * 100,
+            mean_bmi = mean(BMXBMI), pct_obese = mean(obese == "Obese") * 100)
+```
+
+The 5,190 complete cases and the 739 excluded participants are very similar in age (54.0 vs 53.5 years), sex (54.7% vs 55.8% women) and obesity (41.2% vs 40.9%), so excluding them is unlikely to bias the results.
+
+For the machine learning in part 4, imputation may still be useful to keep more participants. In that case, the imputation (e.g. median or kNN) will be fitted on the **training set only** and then applied to the test set, to avoid data leakage (machine learning lecture).
+
+# Step 1.8: selection of laboratory features
+
+*What: five filters (387 → 101 features) and a variability check. Why: remove uninformative features with criteria that do not use any group label (required for part 3).*
 
 The 387 laboratory variables are the high-dimensional part of the dataset, and we will use them for the multiple testing study (part 3) and as candidate predictors (part 4). We select the informative ones in five steps. **None of these steps uses an outcome or group label** (such as obesity), which is required for part 3: the filter must not favour features that differ between the groups we will compare.
 
@@ -340,7 +584,7 @@ step1 <- lab_vars %>% filter(!is_weight, !is_comment, !is_fasting_question)
 step2 <- step1 %>% filter(!duplicated(paste(file, base_label)))
 ```
 
-**Step 3: less than 20% missing values.** This removes the subsample panels described in section 7, which would leave too few complete samples for multivariable analyses. The threshold falls in a natural gap: the remaining variables have at most 11% missing values, the next ones 33% (LDH) or more.
+**Step 3: less than 20% missing values.** This removes the subsample panels described in step 1.7, which would leave too few complete samples for multivariable analyses. The threshold falls in a natural gap: the remaining variables have at most 11% missing values, the next ones 33% (LDH) or more.
 
 ```{r lab-step3}
 pct_missing_lab <- colMeans(is.na(nhanes[, step2$variable]))
@@ -404,11 +648,29 @@ tibble(
 ) %>% knitr::kable()
 ```
 
+Lesson 2 also suggests removing features with (almost) no variability, using e.g. the coefficient of variation (CV = SD / mean). Fewer features means fewer tests, so a smaller multiple testing correction and more power.
+
+```{r lab-cv}
+cv <- sapply(nhanes[, lab_features], function(x) sd(x, na.rm = TRUE) / mean(x, na.rm = TRUE))
+summary(cv)
+head(sort(cv), 6)   # least variable features
+```
+
+The least variable features are sodium (CV 1.8%), osmolality, mean corpuscular hemoglobin concentration, chloride and calcium. Their low variability is not technical noise but **homeostasis**: the body keeps these values within narrow limits. They are measured precisely and can still differ between groups, so we keep them; no feature has a CV close to zero.
+
 We keep **101 laboratory features**. They cover complete blood count, biochemistry (liver and kidney function, electrolytes, lipids), glycohemoglobin, fatty acids, folate forms, vitamin D, sex hormones, metals, inflammation (CRP) and urine albumin/creatinine.
 
-# Distributions and transformation
+# Step 1.9: normalisation and log2 transformation
 
-## Skewness
+*What: no normalisation; log2 transformation of right-skewed features. Why: lab values are absolute concentrations; log2 makes skewed values more symmetric for linear models.*
+
+## Normalisation
+
+In lesson 2, normalisation means removing unwanted technical variation between samples, such as differences in sequencing depth (RNA-seq) or RNA input (qPCR). **This step is not needed for our data**: each laboratory value is an absolute concentration, measured with a calibrated clinical assay under the quality control of the NHANES laboratories. There is no library size or input amount that differs between participants and would have to be corrected.
+
+## Distributions and transformation
+
+### Skewness
 
 Most laboratory values are concentrations, which are typically right-skewed: many low values and a long tail of high values. Skewed variables violate the normality assumption of t-tests and linear models, and a few extreme values dominate the mean, the variance and the PCA. We quantify the asymmetry with the skewness: 0 for a symmetric distribution; above 1 indicates a strong right tail.
 
@@ -425,7 +687,7 @@ summary(skew_before)
 sum(skew_before > 1)
 ```
 
-## Log2 transformation
+### Log2 transformation
 
 We log2-transform every feature with a skewness above 1 (`r sum(skew_before > 1)` of the `r length(lab_features)` features). On a log2 scale, a difference of 1 corresponds to a doubling of the concentration, which is easy to interpret (cf. log fold changes in the RNA-seq practical). One feature (eosinophil percentage) contains zeros; for that one, we add half of the smallest positive value before taking the log, similar to the pseudocount used for RNA-seq counts.
 
@@ -491,7 +753,9 @@ ggarrange(
 )
 ```
 
-# Outliers
+# Step 1.10: outliers
+
+*What: ranges, boxplots, IQR and z-score rules, BMI consistency check. Why: guiding question 3 — technical error or interesting biology?*
 
 ## Clinical measurements
 
@@ -517,6 +781,22 @@ nhanes %>%
   labs(x = NULL, y = NULL)
 ```
 
+Lesson 2 describes two common rules to flag outliers: the **IQR rule** (below Q1 − 1.5 × IQR or above Q3 + 1.5 × IQR, as used by `boxplot()`) and the **z-score rule** (more than 3 SD from the mean). We count the flagged values per variable:
+
+```{r outlier-rules}
+outlier_tbl <- map_dfr(names(continuous_vars), function(lab) {
+  x <- na.omit(nhanes[[continuous_vars[[lab]]]])
+  q <- quantile(x, c(0.25, 0.75))
+  iqr <- q[[2]] - q[[1]]
+  tibble(variable = lab, n = length(x),
+         n_iqr_outliers = sum(x < q[[1]] - 1.5 * iqr | x > q[[2]] + 1.5 * iqr),
+         n_z_above_3 = sum(abs((x - mean(x)) / sd(x)) > 3))
+})
+knitr::kable(outlier_tbl)
+```
+
+The IQR rule flags 171 BMI values (2.9%) and 154 systolic blood pressures (2.6%), nearly all on the high side. For right-skewed variables, the IQR rule always flags part of the long tail. These participants have severe obesity or hypertension: they are exactly the group our research question is about, not measurement errors. As lesson 2 states, an observation should not be removed simply because it appears to be an outlier.
+
 As an internal consistency check, we recompute the BMI from the measured weight and height. The differences are smaller than 0.05 kg/m², i.e. only rounding:
 
 ```{r bmi-check}
@@ -540,7 +820,57 @@ The features with the most extreme values are biologically interpretable. HbA1c 
 
 Whether whole *samples* behave unlike the rest is checked with the PCA in the next section.
 
-# PCA: do samples cluster by biology or by technical factors?
+# Step 1.11: standardisation, PCA and clustering
+
+*What: z-score standardisation, PCA, hierarchical clustering and a correlation heatmap. Why: guiding question 5 — do samples cluster by biology or by a technical factor?*
+
+## Standardisation
+
+The laboratory features have very different units and ranges (e.g. sodium around 140 mmol/L, CRP around 2 mg/L). In methods that use distances or variances, such as PCA, clustering and heatmaps, the features with the largest values would dominate. We therefore **standardise** (z-score: subtract the mean and divide by the SD) before these analyses, so that every feature has mean 0 and SD 1.
+
+The boxplots show the 20 markers selected a priori for part 3, before and after standardisation:
+
+```{r standardisation, fig.height = 7}
+std_before <- lab_log[, markers_part3]
+std_after  <- as_tibble(scale(std_before))
+
+bind_rows(
+  std_before %>% pivot_longer(everything()) %>% mutate(scale = "Before: log2 scale where applied"),
+  std_after  %>% pivot_longer(everything()) %>% mutate(scale = "After: standardised (z-score)")
+) %>%
+  drop_na(value) %>%
+  mutate(scale = factor(scale, levels = c("Before: log2 scale where applied",
+                                          "After: standardised (z-score)"))) %>%
+  ggplot(aes(x = name, y = value)) +
+  geom_boxplot(outlier.size = 0.3, outlier.alpha = 0.3) +
+  facet_wrap(~ scale, ncol = 1, scales = "free_y") +
+  labs(x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+Two remarks:
+
+- Standardisation is used for **exploration** (PCA, heatmaps). The regression models in parts 2 and 3 use the log2 values, so the effects stay interpretable (e.g. "CRP is 2.5 times higher").
+- In part 4 (machine learning), standardisation will be fitted on the **training set only** and then applied to the test set. Standardising the whole dataset before splitting would leak information from the test set into the model (data leakage, machine learning lecture).
+
+## PCA: do samples cluster by biology or by technical factors?
+
+**What is a PCA?** A PCA summarises many variables into a few new ones, the
+*principal components* (PCs). Each PC is a weighted combination of the original
+variables. PC1 is the direction in which participants differ the most, PC2 the
+next largest direction (perpendicular to PC1), and so on. This way, the main
+patterns in 101 blood markers can be shown in a two-dimensional plot.
+
+- **Score**: the value of one participant on a PC (a dot in the PCA plot).
+- **Loading**: how much each blood marker contributes to a PC, and in which direction.
+- **Explained variance**: the share of all differences between participants captured by a PC.
+
+The markers are standardised first, so that each marker counts equally regardless
+of its unit. The sign of a PC is arbitrary: only the differences between groups matter.
+
+**Why we use it:** to check whether participants cluster by biology (age, sex,
+BMI) or by a technical factor (exam period, exam session). A technical factor
+driving a PC would point to a measurement problem (batch effect).
 
 We perform a PCA on the 101 log-transformed laboratory features. PCA requires complete data, so we use the 4,261 participants without any missing laboratory value (70.7% of the study population). The features have very different units, so they are standardised (mean 0, SD 1) with `scale. = TRUE`. Otherwise features with a large variance (e.g. platelet count) would dominate the components.
 
@@ -560,7 +890,7 @@ pca_scores <- as_tibble(pca_res$x[, 1:10]) %>%
 nrow(pca_scores)
 ```
 
-## Explained variance
+### Explained variance
 
 ```{r scree}
 tibble(pc = 1:20,
@@ -575,7 +905,7 @@ tibble(pc = 1:20,
 
 The first components explain only a modest part of the variance (PC1 8.5%, PC2 6.5%, PC3 6.0%; 30% for the first five). This is expected: the panel combines many largely independent physiological systems (blood count, liver, kidney, hormones, nutrition), unlike e.g. a transcriptome where many genes are co-regulated.
 
-## PC1 versus PC2, coloured by biological and technical factors
+### PC1 versus PC2, coloured by biological and technical factors
 
 ```{r pca-plots, fig.width = 10, fig.height = 11}
 pca_plot <- function(colour_var, title) {
@@ -596,7 +926,7 @@ ggarrange(
 )
 ```
 
-## Which factors are associated with the principal components?
+### Which factors are associated with the principal components?
 
 To quantify the plots, we fit a linear model of each of the first five components on each factor and report the R² (the proportion of the variance of the component explained by the factor).
 
@@ -628,7 +958,7 @@ pca_scores %>%
        title = "The third principal component reflects body weight")
 ```
 
-## Which features drive PC1 and PC2?
+### Which features drive PC1 and PC2?
 
 ```{r loadings, fig.height = 6}
 as_tibble(pca_res$rotation[, 1:2], rownames = "variable") %>%
@@ -655,7 +985,47 @@ as_tibble(pca_res$rotation[, 1:2], rownames = "variable") %>%
 
 The samples thus cluster by biology (age, sex, BMI), not by a technical batch factor. Because age and sex dominate the laboratory profile, **they are important potential confounders** and must be included as covariates in the analyses of parts 2 and 3.
 
-# Correlation structure of the laboratory features
+## Hierarchical clustering of the participants
+
+Lesson 2 uses a heatmap with hierarchical clustering to check whether samples cluster according to biology or according to a technical factor. We cluster 500 randomly chosen participants (from the complete cases of the PCA) on their 101 standardised laboratory features, with Manhattan distance and Ward clustering as in the neuroblastoma example of lesson 2. Values are truncated at ±3 SD so that a few extreme values do not dominate the colour scale.
+
+```{r sample-heatmap, fig.width = 10, fig.height = 10}
+set.seed(2026)
+hm_rows <- sample(nrow(pca_input), 500)
+
+hm_mat <- pca_input %>% select(-SEQN) %>% as.matrix() %>% scale()
+hm_mat <- t(hm_mat[hm_rows, ])          # features in rows, participants in columns
+hm_mat[hm_mat > 3] <- 3
+hm_mat[hm_mat < -3] <- -3
+
+hm_meta <- tibble(SEQN = pca_input$SEQN[hm_rows]) %>%
+  left_join(nhanes %>% select(SEQN, obese, sex, age_group, exam_period), by = "SEQN")
+
+hm_annotation <- HeatmapAnnotation(
+  Obesity       = hm_meta$obese,
+  Sex           = hm_meta$sex,
+  `Age group`   = hm_meta$age_group,
+  `Exam period` = hm_meta$exam_period,
+  col = list(Obesity       = c("Not obese" = "grey85", "Obese" = "#D85A30"),
+             Sex           = c("Male" = "#4393C3", "Female" = "#D6604D"),
+             `Age group`   = c("20-39" = "#E0E0E0", "40-59" = "#999999", "60+" = "#404040"),
+             `Exam period` = c("Nov-Apr" = "#80CDC1", "May-Oct" = "#DFC27D"))
+)
+
+Heatmap(hm_mat,
+        name = "z-score",
+        col = circlize::colorRamp2(c(-3, 0, 3), c("#2166AC", "white", "#B2182B")),
+        top_annotation = hm_annotation,
+        clustering_distance_columns = "manhattan", clustering_method_columns = "ward.D2",
+        clustering_distance_rows = "euclidean", clustering_method_rows = "ward.D2",
+        show_column_names = FALSE,
+        row_names_gp = grid::gpar(fontsize = 4),
+        column_title = "500 participants clustered on 101 standardised laboratory features")
+```
+
+The participants do not split into sharply separated groups: the laboratory profile varies gradually, as expected for a general population sample (unlike, e.g., tumour subtypes). The clusters partly follow sex and obesity, in line with the PCA, while the exam period is mixed across all clusters. This confirms that there is **no technical batch effect**, so batch correction (optional step 4 of lesson 2) is not needed.
+
+## Correlation structure of the laboratory features
 
 A clustered correlation heatmap shows which features carry overlapping information. This matters for interpreting multiple tests (part 3: tests on correlated features are not independent) and feature importance (part 4).
 
@@ -675,9 +1045,11 @@ Heatmap(cor_mat,
 
 The features form clear modules that correspond to physiological systems and laboratory panels: red blood cell indices, white blood cell counts, folate forms, fatty acids, sex hormones, and liver enzymes. Within these modules, correlations are high. The highest values (r ≈ 0.96–0.97, e.g. hemoglobin–hematocrit and the two RBC folate assays) are between closely related but distinct measurements, not between pure duplicates.
 
-# Save the preprocessed data
+# Step 1.12: save the preprocessed data
 
-We save two files for the next parts:
+*What: save the cleaned data and two tables. Why: parts 2–4 start from exactly the same data (reproducibility).*
+
+We save the following files in the `output` folder for the next parts:
 
 - `nhanes_clean.rds`: the study population (6,023 adults) with the recoded clinical variables and the 101 laboratory features on their **original** scale. The original scale is needed for clinical definitions, e.g. diabetes as HbA1c ≥ 6.5%.
 - `nhanes_lab_log2.rds`: the same 101 laboratory features, **log2-transformed** where applicable, to be used for statistical testing and PCA.
@@ -701,9 +1073,14 @@ lab_info <- tibble(variable = lab_features) %>%
          log2_transformed = variable %in% to_log,
          skew_after = round(skew_after[variable], 2))
 
-saveRDS(nhanes_clean, file.path(data_dir, "nhanes_clean.rds"))
-saveRDS(nhanes_lab_log2, file.path(data_dir, "nhanes_lab_log2.rds"))
-write_csv(lab_info, file.path(data_dir, "lab_features.csv"))
+saveRDS(nhanes_clean, file.path(output_dir, "nhanes_clean.rds"))
+saveRDS(nhanes_lab_log2, file.path(output_dir, "nhanes_lab_log2.rds"))
+write_csv(lab_info, file.path(output_dir, "lab_features.csv"))
+
+# The 20 markers selected a priori for part 3
+write_csv(tibble(variable = markers_part3) %>%
+            left_join(codebook %>% select(variable, label), by = "variable"),
+          file.path(output_dir, "markers_part3.csv"))
 
 dim(nhanes_clean)
 dim(nhanes_lab_log2)
@@ -719,9 +1096,11 @@ dim(nhanes_lab_log2)
 
 **Samples or features that behave unlike the rest?** Clinical extremes (BMI up to 74.8, systolic BP up to 232 mmHg) are plausible and kept. Extreme laboratory values correspond to clinical subgroups (diabetes, supplement or hormone use) and are kept. The PCA shows no outlying samples. Features that are mostly below the detection limit, categorical or duplicated were removed.
 
-**Preprocessing steps.** Selection of 101 laboratory features with five label-independent filters; a log2 transformation of the 63 right-skewed features; standardisation within the PCA. Normalisation as for RNA-seq is not needed: each laboratory value is an absolute, calibrated concentration.
+**Preprocessing steps (in the order of lesson 2).** Selection of 101 laboratory features with five label-independent filters; a log2 transformation of the 63 right-skewed features; standardisation within the PCA. Normalisation as for RNA-seq is not needed: each laboratory value is an absolute, calibrated concentration.
 
 **Do samples cluster by biology or by a technical factor?** By biology. PC1 reflects age, PC2 sex and PC3 BMI, the biology of interest for our research question. The exam period and session explain at most about 1% of the variance of any of the first five components.
+
+**Order and leakage.** Filtering, log transformation and standardisation were done without using the outcome (obesity), so they cannot bias the tests of part 3. For part 4, standardisation and any imputation will be fitted on the training set only.
 
 **Is the dataset suitable for the next parts?** Yes. For our research question (obesity), all variables are available: the outcome (BMI), the explanatory variables and confounders of part 2 (race/ethnicity, sex, age, income), the confounders of part 3 (age, sex, race/ethnicity, smoking) and the 101 laboratory features. There are 5,929 adults with a BMI (41.1% obese), 5,824 with a blood pressure measurement and 5,371–5,870 with each laboratory feature (4,261 with all 101 features). This is ample for multivariable models (part 2), a multiple testing study over 101 features (part 3) and a machine learning model with a separate test set (part 4). Age and sex must be included as covariates because they dominate the laboratory profile.
 
